@@ -10,10 +10,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
+import yaml
+
 from flowx import ir_serde
-from flowx.bundler.dab_writer import _rewrite_post_branch_dependencies, pipeline_dict_to_ir
+from flowx.bundler.dab_writer import pipeline_dict_to_ir, write_bundle
 from flowx.models.adf_ast import AdfActivity, AdfDefinitions, AdfDependency, AdfPipeline, AdfVariable
 from flowx.models.dab import DabNotebook
 from flowx.preparer.activity_preparers.naming import notebook_filename
@@ -55,7 +58,6 @@ def test_inputs_bridge_marker_precedes_imports() -> None:
     )
     lines = source.splitlines()
     assert lines[0] == "# Databricks notebook source"
-    # The bridge still publishes the computed value.
     assert "dbutils.jobs.taskValues.set(key='items', value=_bridge_value)" in source
 
 
@@ -77,23 +79,65 @@ def _condition_join_tasks() -> list[dict]:
         {
             "task_key": "ProcessItems",
             "depends_on": [
-                {"task_key": "CheckRunMode"},  # outcome-less -> rewritten to terminals
+                {"task_key": "CheckRunMode"},
                 {"task_key": "items_bridge"},
             ],
         },
     ]
 
 
-def test_condition_join_uses_none_failed_not_at_least_one_success() -> None:
-    tasks = _condition_join_tasks()
-    _rewrite_post_branch_dependencies(tasks)
-    join = next(t for t in tasks if t["task_key"] == "ProcessItems")
+def _bundled_tasks(tasks: list[dict[str, Any]], output_dir: Path) -> dict[str, dict[str, Any]]:
+    workflow = PreparedWorkflow(name="job", tasks=tasks, notebooks=[], secrets=[], setup_tasks=[])
+    write_bundle(workflow, output_dir)
+    job = yaml.safe_load((output_dir / "resources" / "job.yml").read_text())["resources"]["jobs"]["job"]
+    return {task["task_key"]: task for task in job["tasks"]}
+
+
+def _dependency_keys(task: dict[str, Any]) -> set[str]:
+    return {dependency["task_key"] for dependency in task["depends_on"]}
+
+
+def test_condition_join_uses_none_failed_not_at_least_one_success(tmp_path: Path) -> None:
+    join = _bundled_tasks(_condition_join_tasks(), tmp_path)["ProcessItems"]
 
     assert join["run_if"] == "NONE_FAILED"
-    # The outcome-less condition edge is replaced by the branch terminal,
-    # the always-on sibling is preserved.
-    dep_keys = {d["task_key"] for d in join["depends_on"]}
-    assert dep_keys == {"NotifyFull", "items_bridge"}
+    assert _dependency_keys(join) == {"NotifyFull", "items_bridge"}
+
+
+def test_switch_case_join_uses_none_failed(tmp_path: Path) -> None:
+    tasks: list[dict[str, Any]] = [
+        {"task_key": "RouteMode", "condition_task": {"op": "EQUAL_TO"}},
+        {
+            "task_key": "RouteMode_case_full",
+            "condition_task": {"op": "EQUAL_TO"},
+            "depends_on": [{"task_key": "RouteMode", "outcome": "false"}],
+        },
+        {"task_key": "LoadDelta", "depends_on": [{"task_key": "RouteMode", "outcome": "true"}]},
+        {"task_key": "LoadFull", "depends_on": [{"task_key": "RouteMode_case_full", "outcome": "true"}]},
+        {"task_key": "Publish", "depends_on": [{"task_key": "RouteMode"}]},
+    ]
+    join = _bundled_tasks(tasks, tmp_path)["Publish"]
+
+    assert join["run_if"] == "NONE_FAILED"
+    assert _dependency_keys(join) == {"LoadDelta", "LoadFull"}
+
+
+def test_non_join_task_keeps_its_run_if(tmp_path: Path) -> None:
+    tasks = _condition_join_tasks()
+    tasks.append({"task_key": "Cleanup", "depends_on": [{"task_key": "items_bridge"}], "run_if": "ALL_DONE"})
+    tasks.append({"task_key": "Audit", "depends_on": [{"task_key": "items_bridge"}]})
+    by_key = _bundled_tasks(tasks, tmp_path)
+
+    assert by_key["Cleanup"]["run_if"] == "ALL_DONE"
+    assert "run_if" not in by_key["Audit"]
+    assert "run_if" not in by_key["NotifyFull"]
+
+
+def test_condition_join_keeps_explicit_run_if(tmp_path: Path) -> None:
+    tasks = _condition_join_tasks()
+    next(task for task in tasks if task["task_key"] == "ProcessItems")["run_if"] = "ALL_DONE"
+
+    assert _bundled_tasks(tasks, tmp_path)["ProcessItems"]["run_if"] == "ALL_DONE"
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +226,54 @@ def test_find_dead_keeps_init_read_by_another_init() -> None:
     assert _find_dead(tasks, {"_init_base", "_init_derived"}) == frozenset()
 
 
+def test_find_dead_reports_whole_unused_init_chain() -> None:
+    tasks = [
+        {"task_key": "_init_a"},
+        {"task_key": "_init_b", "notebook_task": {"base_parameters": {"v": "{{tasks._init_a.values.a}}"}}},
+        {"task_key": "Reader"},
+    ]
+    assert _find_dead(tasks, {"_init_a", "_init_b"}) == {"_init_a", "_init_b"}
+
+
+def test_find_dead_keeps_init_read_from_notebook_code_with_double_quotes() -> None:
+    tasks = [{"task_key": "_init_runMode"}, {"task_key": "Web"}]
+    notebook = DabNotebook(
+        relative_path="src/notebooks/web.py",
+        content='mode = dbutils.jobs.taskValues.get(taskKey="_init_runMode", key="runMode")',
+    )
+    assert _find_dead(tasks, {"_init_runMode"}, notebooks=(notebook,)) == frozenset()
+
+
+def test_find_dead_keeps_init_named_in_foreach_inner_job_parameters() -> None:
+    tasks = [
+        {"task_key": "_init_items"},
+        {
+            "task_key": "Loop",
+            "for_each_task": {
+                "inputs": "[1, 2]",
+                "task": {
+                    "task_key": "Loop_iteration",
+                    "run_job_task": {"job_id": "1", "job_parameters": {"source_task_key": "_init_items"}},
+                },
+            },
+        },
+    ]
+    assert _find_dead(tasks, {"_init_items"}) == frozenset()
+
+
+def test_find_dead_ignores_unrelated_field_equal_to_key() -> None:
+    tasks = [
+        {"task_key": "_init_runMode"},
+        {
+            "task_key": "Reader",
+            "description": "_init_runMode",
+            "tags": {"origin": "_init_runMode"},
+            "sql_task": {"parameters": {"config": {"origin": "_init_runMode"}}},
+        },
+    ]
+    assert _find_dead(tasks, {"_init_runMode"}) == {"_init_runMode"}
+
+
 def test_find_dead_only_touches_synthesized_keys() -> None:
     """A task the translator did not synthesise is never reported, even when unreferenced."""
     tasks = [{"task_key": "_init_report"}, {"task_key": "Downstream"}]
@@ -252,7 +344,6 @@ def test_dominated_init_is_pruned_with_its_notebook() -> None:
         ],
     )
     report = _report_dict(pipeline)
-    # The report still carries the init task; pruning happens at package time.
     assert "_init_runMode" in {task["task_key"] for task in report["tasks"]}
     assert report["synthesized_variable_init_keys"] == ["_init_runMode"]
 
@@ -261,6 +352,42 @@ def test_dominated_init_is_pruned_with_its_notebook() -> None:
     assert "SetRunMode" in _task_keys(workflow)
     assert not _has_init_notebook(workflow, "_init_runMode")
     assert _has_init_notebook(workflow, "SetRunMode")
+
+
+def _unresolved_init_report(*activities: AdfActivity) -> dict[str, Any]:
+    report = _report_dict(
+        AdfPipeline(
+            name="p",
+            variables={"runMode": AdfVariable(type="String", default_value="full")},
+            activities=list(activities),
+        )
+    )
+    init_task = next(task for task in report["tasks"] if task["task_key"] == "_init_runMode")
+    init_task.update(value_kind="unresolved", raw_expression="@pipeline().globalParameters.mode")
+    return report
+
+
+def _setup_task_keys(workflow: PreparedWorkflow) -> set[str]:
+    return {setup_task.config.get("task_key") for setup_task in workflow.setup_tasks}
+
+
+def test_dominated_init_is_pruned_with_its_setup_tasks() -> None:
+    workflow = _package(
+        _unresolved_init_report(
+            AdfActivity(
+                name="SetRunMode", type="SetVariable", type_properties={"variableName": "runMode", "value": "x"}
+            ),
+            _notebook_reading("Reader", "runMode", depends_on="SetRunMode"),
+        )
+    )
+    assert "_init_runMode" not in _task_keys(workflow)
+    assert "_init_runMode" not in _setup_task_keys(workflow)
+
+
+def test_read_init_keeps_its_setup_tasks() -> None:
+    workflow = _package(_unresolved_init_report(_notebook_reading("Reader", "runMode")))
+    assert "_init_runMode" in _task_keys(workflow)
+    assert "_init_runMode" in _setup_task_keys(workflow)
 
 
 def test_read_init_is_kept() -> None:
@@ -300,7 +427,6 @@ def test_init_read_by_merged_agentic_task_is_kept() -> None:
         ],
     )
     report = _report_dict(pipeline)
-    # Stand-in for merge_agentic_results swapping in an agent-written task that reads the default.
     report["tasks"].append(
         {
             "name": "AgentTask",

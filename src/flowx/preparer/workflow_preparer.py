@@ -461,7 +461,7 @@ def _prune_dead_variable_inits(
     artifacts: PreparedArtifacts,
     prepared_inits: dict[str, PreparedActivity],
 ) -> tuple[list[dict[str, Any]], PreparedArtifacts]:
-    """Drops synthesised variable-init tasks that nothing references, with their notebooks and setup tasks.
+    """Drops synthesised variable-init tasks that no real task reaches, with their notebooks and setup tasks.
 
     Args:
         tasks: Prepared parent-job task dicts.
@@ -498,7 +498,7 @@ def find_dead_variable_inits(
     artifacts: PreparedArtifacts,
     prepared_inits: dict[str, PreparedActivity],
 ) -> frozenset[str]:
-    """Returns the synthesised variable-init task keys that nothing else references.
+    """Returns the synthesised variable-init task keys that no real task reaches.
 
     Args:
         tasks: Prepared parent-job task dicts.
@@ -511,46 +511,60 @@ def find_dead_variable_inits(
 
     Notes:
         A reference is any of the forms the preparers emit: an anchored task-value token
-        (``tasks.<key>.values``), a ``depends_on`` edge, a parameter whose whole value is the key
-        (AppendVariable's ``source_task_key``), or a ``taskKey='<key>'`` read in generated notebook
-        code.  Matching these forms rather than a bare substring avoids a false keep when the key
-        text merely appears inside an unrelated key or path, such as a sibling ``_init_x_2`` or a
-        notebook path ``/Shared/_init_x_report``.  Only an init's own task and notebook are
-        ignored, so an init read by another init stays live.
+        (``tasks.<key>.values``), a ``depends_on`` edge, a task parameter whose whole value is the
+        key (AppendVariable's ``source_task_key``), or a ``taskKey='<key>'`` read in generated
+        notebook code.  Matching these forms rather than a bare substring avoids a false keep when
+        the key text merely appears inside an unrelated key, path, or metadata field.  An init is
+        live when a real (non-init) task or notebook references it, directly or through a chain of
+        live inits, so a chain of inits that only feed each other is dropped as a whole.
     """
     init_keys = {task["task_key"] for task in tasks if task.get("task_key") in prepared_inits}
-    # Whole string values cover depends_on edges and bare-key parameters alike.
-    referencing_tasks = [
-        (task.get("task_key"), json.dumps(task, default=str), set(_iter_string_values(task)))
+    notebook_owners = {id(notebook): key for key in init_keys for notebook in prepared_inits[key].notebooks}
+    references = [
+        (task.get("task_key"), _task_references(task, init_keys))
         for task in _iter_workflow_tasks(tasks, artifacts.inner_workflows)
+    ] + [
+        (notebook_owners.get(id(notebook)), {key for key in init_keys if _notebook_references(notebook.content, key)})
+        for notebook in artifacts.notebooks
     ]
-    dead_keys: set[str] = set()
-    for key in init_keys:
-        own_notebooks = {id(notebook) for notebook in prepared_inits[key].notebooks}
-        referenced_by_task = any(
-            owner != key and (f"tasks.{key}.values" in serialized_task or key in reference_values)
-            for owner, serialized_task, reference_values in referencing_tasks
-        )
-        referenced_by_notebook = any(
-            _notebook_references(notebook.content, key)
-            for notebook in artifacts.notebooks
-            if id(notebook) not in own_notebooks
-        )
-        if not referenced_by_task and not referenced_by_notebook:
-            dead_keys.add(key)
-    return frozenset(dead_keys)
+    live_keys: set[str] = set()
+    pending = [key for owner, referenced in references if owner not in init_keys for key in referenced]
+    while pending:
+        key = pending.pop()
+        if key not in live_keys:
+            live_keys.add(key)
+            pending.extend(ref for owner, referenced in references if owner == key for ref in referenced)
+    return frozenset(init_keys - live_keys)
 
 
-def _iter_string_values(value: Any) -> Iterable[str]:
-    """Yields every string leaf of a nested dict / list structure."""
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for nested in value.values():
-            yield from _iter_string_values(nested)
-    elif isinstance(value, list):
-        for nested in value:
-            yield from _iter_string_values(nested)
+_PARAMETER_FIELDS = (
+    ("notebook_task", "base_parameters"),
+    ("run_job_task", "job_parameters"),
+    ("spark_python_task", "parameters"),
+    ("spark_jar_task", "parameters"),
+    ("python_wheel_task", "parameters"),
+    ("python_wheel_task", "named_parameters"),
+    ("sql_task", "parameters"),
+)
+
+
+def _task_references(task: dict[str, Any], init_keys: set[str]) -> set[str]:
+    """Returns the init keys that *task* reads through a task-value token, a dependency, or a parameter."""
+    serialized_task = json.dumps(task, default=str)
+    whole_values = {value for value in _iter_reference_values(task) if isinstance(value, str)}
+    return {key for key in init_keys if f"tasks.{key}.values" in serialized_task or key in whole_values}
+
+
+def _iter_reference_values(task: dict[str, Any]) -> Iterable[Any]:
+    """Yields *task*'s ``depends_on`` keys and parameter values, including a ForEach body task's."""
+    for dependency in task.get("depends_on") or []:
+        yield dependency.get("task_key")
+    for task_type, field_name in _PARAMETER_FIELDS:
+        parameters = (task.get(task_type) or {}).get(field_name) or {}
+        yield from parameters.values() if isinstance(parameters, dict) else parameters
+    body_task = (task.get("for_each_task") or {}).get("task")
+    if body_task:
+        yield from _iter_reference_values(body_task)
 
 
 def _notebook_references(content: str, task_key: str) -> bool:
